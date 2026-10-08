@@ -1,0 +1,273 @@
+# iOS build — free macOS runners on a public repo; produces a downloadable IPA.
+#
+# Same shape as the Android job: the PRIVATE source repo is cloned into the
+# runner with a READ-ONLY deploy key, built with `eas build --local`, and
+# destroyed with the runner. Local builds consume no EAS build credits.
+#
+# Signing uses an EAS `credentials.json` written from secrets, so the
+# distribution certificate and provisioning profile exist only for the life of
+# the job. The .p12 is never written to the repo and never printed.
+#
+# WHERE THE BUILD GOES
+# Actions artifacts on a PUBLIC repo are downloadable by anyone who can see the
+# run, and an IPA embeds the whole JS bundle. So nothing is published here: the
+# build is pushed to private R2 storage under
+# app-builds/<app>/<platform>/ and needs no passphrase.
+#
+# NOTE: an IPA signed with an App Store distribution certificate will NOT
+# install directly on a device. For a build you can sideload, use an ad-hoc or
+# enterprise profile in the chosen eas.json profile.
+
+name: Build iOS
+run-name: "Build iOS · ${{ inputs.correlation || 'manual' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        # Free text, not a choice list: the three apps do not share a profile
+        # set (only mago-host defines preview-ios), so a fixed list would be
+        # wrong for two of the three repos.
+        description: "EAS build profile (as named in the app's eas.json)"
+        default: staging
+      ref:
+        description: "Source branch/tag/SHA to build"
+        default: staging
+      correlation:
+        # Stamped into run-name so the client that dispatched this build can
+        # find it again. workflow_dispatch returns 204 with no body, so without
+        # this the only way to identify the run is "the newest one", which
+        # races whenever two builds start together.
+        description: "Correlation id (set by tools/buildkit; leave blank when dispatching by hand)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SRC: src
+
+jobs:
+  build:
+    # Standard macOS runners are free for PUBLIC repositories — this is the
+    # whole reason the harness lives in a separate public repo.
+    #
+    # macos-26 (Xcode 26.6 / Swift 6.3) for every app. macos-15 only carries
+    # Xcode 16.4 / Swift 6.1, and expo-modules-jsi on SDK 56 ships a
+    # Package.swift declaring swift-tools-version 6.2 — its SwiftPM cannot parse
+    # that, and the failure surfaces only as the opaque "Could not resolve
+    # package dependencies" during the ExpoModulesJSI archive script.
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out the build harness (this repo)
+        uses: actions/checkout@v4
+
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          # A deploy key is scoped to exactly one repository and is read-only,
+          # so a leak cannot reach any other repo or write anywhere.
+          ssh-key: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+          path: ${{ env.SRC }}
+          persist-credentials: false
+
+      - name: Set IST release metadata
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M-IST')"
+          source_revision="$(git -C "$SRC" rev-parse --short HEAD)"
+          echo "APP_RELEASE_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "EXPO_PUBLIC_RELEASE_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "APP_RELEASE_SOURCE_REVISION=$source_revision" >> "$GITHUB_ENV"
+          echo "EAS_BUILD_MESSAGE=release $stamp ($source_revision)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+
+      - name: Select the newest Xcode and report Swift
+        # Fastlane otherwise takes /Applications/Xcode.app, which is not always
+        # the newest installed. Pick the highest version explicitly and print
+        # the Swift version, so a tools-version mismatch is obvious in the log
+        # instead of surfacing as "Could not resolve package dependencies".
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          newest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          newest=${newest:-/Applications/Xcode.app}
+          sudo xcode-select -s "$newest"
+          echo "selected: $newest"
+          xcodebuild -version
+          swift --version
+
+      - name: Install dependencies
+        working-directory: ${{ env.SRC }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Write signing credentials from secrets
+        working-directory: ${{ env.SRC }}
+        env:
+          CERT_B64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          : "${CERT_B64:?IOS_DIST_CERT_P12_BASE64 is required}"
+          : "${CERT_PASSWORD:?IOS_DIST_CERT_PASSWORD is required}"
+          : "${PROFILE_B64:?IOS_PROVISIONING_PROFILE_BASE64 is required}"
+          echo "$CERT_B64" | base64 -d > dist-cert.p12
+          echo "$PROFILE_B64" | base64 -d > profile.mobileprovision
+          # jq keeps a password containing quotes/backslashes from corrupting
+          # the JSON, and keeps it out of the log.
+          jq -n \
+            --arg pw "$CERT_PASSWORD" \
+            '{ios:{provisioningProfilePath:"profile.mobileprovision",distributionCertificate:{path:"dist-cert.p12",password:$pw}}}' \
+            > credentials.json
+          echo "cert $(stat -f%z dist-cert.p12) bytes; profile $(stat -f%z profile.mobileprovision) bytes"
+
+      - name: Point the profile at local credentials
+        working-directory: ${{ env.SRC }}
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          # credentialsSource has to be set on the IOS block as well as the
+          # profile: the platform-nested value wins, so an app whose eas.json
+          # says ios.credentialsSource = "remote" ignores the profile-level
+          # patch and signs with whatever EAS holds rather than the certificate
+          # and profile this repo was given.
+          jq --arg p "$PROFILE" '
+            .build[$p].credentialsSource = "local"
+            | .build[$p].ios = ((.build[$p].ios // {}) + {credentialsSource: "local"})
+          ' eas.json > eas.json.tmp
+          mv eas.json.tmp eas.json
+
+      - name: Build with EAS (local — consumes no EAS build credits)
+        working-directory: ${{ env.SRC }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_NO_VCS: "1"
+          PROFILE: ${{ inputs.profile }}
+          APP_RELEASE_STAMP: ${{ env.APP_RELEASE_STAMP }}
+          EXPO_PUBLIC_RELEASE_STAMP: ${{ env.EXPO_PUBLIC_RELEASE_STAMP }}
+          APP_RELEASE_SOURCE_REVISION: ${{ env.APP_RELEASE_SOURCE_REVISION }}
+          EAS_BUILD_MESSAGE: ${{ env.EAS_BUILD_MESSAGE }}
+          # SDK 56 turns on Expo's precompiled xcframeworks by default. Under
+          # `eas build --local` there is no EAS cache, so every tarball is
+          # reported "prebuilt xcframework unavailable; building from source" —
+          # and the from-source path for ExpoModulesJSI then needs SwiftPM
+          # dependency resolution that fails in the archive phase:
+          #   PhaseScriptExecution [CP-User] Build ExpoModulesJSI xcframework
+          #   Could not resolve package dependencies
+          # precompiled_modules.rb enables the feature only when this is exactly
+          # "1", so "0" forces the ordinary from-source build for every module.
+          # Harmless on SDK 54 apps, which never read it.
+          EXPO_USE_PRECOMPILED_MODULES: "0"
+        run: |
+          set -euo pipefail
+          npx eas-cli@24.12.0 build \
+            --local \
+            --non-interactive \
+            --platform ios \
+            --profile "$PROFILE" \
+            --message "$EAS_BUILD_MESSAGE" \
+            --output "$RUNNER_TEMP/app.ipa"
+          ls -lh "$RUNNER_TEMP/app.ipa"
+
+      - name: Verify the archive carries the expected signing identity
+        # The Android side of this harness shipped an artifact signed with a key
+        # the store had never seen, because nothing compared the built binary
+        # against the identity the repo was configured with. Same check here:
+        # the embedded profile must be for this app and this team, and the
+        # certificate must be the one whose private key we supplied.
+        env:
+          EXPECTED_APP_ID: ${{ vars.EXPECTED_IOS_APP_ID }}
+          EXPECTED_CERT_SERIAL: ${{ vars.EXPECTED_IOS_CERT_SERIAL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED_APP_ID:-}" ] || [ -z "${EXPECTED_CERT_SERIAL:-}" ]; then
+            echo "::error::EXPECTED_IOS_APP_ID / EXPECTED_IOS_CERT_SERIAL are not set on this repository. Refusing to publish an archive whose signing identity nobody has declared."
+            exit 1
+          fi
+          work="$RUNNER_TEMP/verify"; rm -rf "$work"; mkdir -p "$work"
+          unzip -o -q "$RUNNER_TEMP/app.ipa" 'Payload/*/embedded.mobileprovision' -d "$work"
+          prov=$(find "$work" -name embedded.mobileprovision | head -1)
+          if [ -z "$prov" ]; then
+            echo "::error::no embedded.mobileprovision in the archive - it is not signed for distribution."
+            exit 1
+          fi
+          identity=$(openssl smime -inform der -verify -noverify -in "$prov" 2>/dev/null             | python3 -c "import plistlib,subprocess,sys; p=plistlib.loads(sys.stdin.buffer.read()); c=p['DeveloperCertificates'][0]; s=subprocess.run(['openssl','x509','-inform','der','-noout','-serial'],input=c,capture_output=True).stdout.decode().split('=')[1].strip(); print(p['Entitlements']['application-identifier'], s)")
+          app_id="${identity%% *}"
+          serial="${identity##* }"
+          echo "expected  $EXPECTED_APP_ID  $EXPECTED_CERT_SERIAL"
+          echo "actual    $app_id  $serial"
+          if [ "$app_id" != "$EXPECTED_APP_ID" ]; then
+            echo "::error::Provisioning profile is for $app_id, not $EXPECTED_APP_ID - this archive would go to the wrong App Store record."
+            exit 1
+          fi
+          if [ "$serial" != "$EXPECTED_CERT_SERIAL" ]; then
+            echo "::error::Signed with certificate $serial, expected $EXPECTED_CERT_SERIAL."
+            exit 1
+          fi
+          echo "signing identity matches the certificate and profile Apple knows"
+
+      - name: Upload to private artifact storage
+        # The artifact goes to private cloud storage instead of GitHub Actions
+        # artifacts, which on a PUBLIC repo are downloadable by anyone. Nothing
+        # is published from this repo, so the binary needs no passphrase.
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_BUILDS }}
+          EXT: ipa
+          SRC_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF:-}" ]; then
+            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build."
+            exit 1
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || {
+            echo "::error::rclone install failed"; exit 1; }
+
+          # sha256 used to be produced by the (now removed) encrypt step.
+          ( cd "$RUNNER_TEMP" && shasum -a 256 "app.${EXT}" > sha256.txt && cat sha256.txt )
+
+          conf="$RUNNER_TEMP/rclone.conf"
+          printf '%s' "$RCLONE_CONF" > "$conf"
+          chmod 600 "$conf"
+
+          # Repo is <app>-deploy; the OneDrive folder is <app>.
+          app="${GITHUB_REPOSITORY##*/}"; app="${app%-deploy}"
+          # Stamp the file so builds are self-describing in the folder listing.
+          stamp="$APP_RELEASE_STAMP"
+          name="${app}-ios-${stamp}-run${GITHUB_RUN_NUMBER}.${EXT}"
+
+          rclone --config "$conf" copyto "$RUNNER_TEMP/app.${EXT}" \
+            "builds:${app}/ios/${name}" --no-traverse
+          rclone --config "$conf" copyto "$RUNNER_TEMP/sha256.txt" \
+            "builds:${app}/ios/${name}.sha256" --no-traverse
+          rm -f "$conf"
+
+          {
+            echo "### Build uploaded"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| file | \`${name}\` |"
+            echo "| Private storage | \`app-builds/${app}/ios/\` |"
+            echo "| source ref | \`${SRC_SHA}\` |"
+            echo "| sha256 | \`$(cut -d" " -f1 "$RUNNER_TEMP/sha256.txt")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "uploaded ${name}"
+
+      - name: Scrub credentials from the runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/rclone.conf" "$SRC/credentials.json" "$SRC/dist-cert.p12" "$SRC/profile.mobileprovision" || true
